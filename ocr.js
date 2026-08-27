@@ -533,22 +533,75 @@ export class ScreenshotOCRController {
         const menuWidth = naturalWidth || 200;
         const menuHeight = naturalHeight || 44;
 
+        const margin = 12;
+        const stageWidth = global.stage.width;
+        const stageHeight = global.stage.height;
+
         const centerX = selection.x + selection.width / 2;
-        const x = Math.max(
-            12,
-            Math.min(global.stage.width - menuWidth - 12, Math.round(centerX - menuWidth / 2))
+        const clampedCenterX = Math.max(
+            margin,
+            Math.min(stageWidth - menuWidth - margin, Math.round(centerX - menuWidth / 2))
         );
 
-        // Place below the selection; fall back to above if no room below.
-        const belowY = Math.round(selection.y + selection.height + 12);
-        const aboveY = Math.round(selection.y - menuHeight - 12);
-        const y = belowY + menuHeight <= global.stage.height - 12
-            ? belowY
-            : Math.max(12, aboveY);
+        const centerY = selection.y + selection.height / 2;
+        const clampedCenterY = Math.max(
+            margin,
+            Math.min(stageHeight - menuHeight - margin, Math.round(centerY - menuHeight / 2))
+        );
 
-        this._copyMenu.set_position(x, y);
+        // Prefer below the selection, then above, then to either side, skipping
+        // any spot that runs off-screen or collides with the screenshot HUD.
+        const blocker = this._getHudRect(margin);
+        const candidates = [
+            {x: clampedCenterX, y: Math.round(selection.y + selection.height + margin)},
+            {x: clampedCenterX, y: Math.round(selection.y - menuHeight - margin)},
+            {x: Math.round(selection.x + selection.width + margin), y: clampedCenterY},
+            {x: Math.round(selection.x - menuWidth - margin), y: clampedCenterY},
+        ];
+
+        let placement = null;
+        for (const candidate of candidates) {
+            const rect = {x: candidate.x, y: candidate.y, width: menuWidth, height: menuHeight};
+            if (rect.x < margin || rect.y < margin ||
+                rect.x + menuWidth > stageWidth - margin ||
+                rect.y + menuHeight > stageHeight - margin)
+                continue;
+            if (blocker && _rectsOverlap(rect, blocker))
+                continue;
+            placement = candidate;
+            break;
+        }
+
+        if (!placement) {
+            // Nothing was fully clear; fall back to below/above on-screen.
+            const belowY = Math.round(selection.y + selection.height + margin);
+            const aboveY = Math.round(selection.y - menuHeight - margin);
+            const y = belowY + menuHeight <= stageHeight - margin
+                ? belowY
+                : Math.max(margin, aboveY);
+            placement = {x: clampedCenterX, y};
+        }
+
+        this._copyMenu.set_position(placement.x, placement.y);
         this._copyMenu.visible = true;
         this._hitboxLayer.set_child_above_sibling(this._copyMenu, null);
+    }
+
+    _getHudRect(inflate = 0) {
+        const panel = Main.screenshotUI?._panel;
+        if (!panel || !panel.visible)
+            return null;
+
+        const extents = panel.get_transformed_extents();
+        if (!extents)
+            return null;
+
+        return {
+            x: extents.get_x() - inflate,
+            y: extents.get_y() - inflate,
+            width: extents.get_width() + inflate * 2,
+            height: extents.get_height() + inflate * 2,
+        };
     }
 
     _hideCopyMenu() {
@@ -645,6 +698,13 @@ export class ScreenshotOCRController {
             closeAfterCopy: this._settings.get_boolean('close-after-copy'),
         };
     }
+}
+
+function _rectsOverlap(a, b) {
+    return a.x < b.x + b.width &&
+        a.x + a.width > b.x &&
+        a.y < b.y + b.height &&
+        a.y + a.height > b.y;
 }
 
 function _roundedRect(cr, x, y, width, height, radius) {
