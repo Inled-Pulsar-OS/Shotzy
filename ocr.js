@@ -27,24 +27,49 @@ const DEFAULT_OCR = {
     searchEngine: 'google',
     closeAfterCopy: false,
 };
-const TESSDATA_DIR = GLib.getenv('TESSDATA_PREFIX') || '/usr/share/tessdata';
+const TESSDATA_DIR = '/usr/share/tessdata';
 
 const OCRHighlightOverlay = GObject.registerClass(
 class OCRHighlightOverlay extends St.DrawingArea {
     _init() {
         super._init({
             reactive: false,
-            visible: false,
+            visible: true,
         });
 
         this._boxes = [];
+        this._selectionGeometry = null;
         this._style = DEFAULT_STYLE;
+        this._angle = 0.0;
+        this._animTimerId = 0;
     }
 
     setBoxes(boxes) {
         this._boxes = boxes;
-        this.visible = boxes.length > 0;
         this.queue_repaint();
+    }
+
+    setSelectionGeometry(geom) {
+        this._selectionGeometry = geom;
+        if (geom && !this._animTimerId) {
+            this._animTimerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 20, () => {
+                this._angle = (this._angle + 0.04) % (2 * Math.PI);
+                this.queue_repaint();
+                return GLib.SOURCE_CONTINUE;
+            });
+        } else if (!geom && this._animTimerId) {
+            GLib.source_remove(this._animTimerId);
+            this._animTimerId = 0;
+        }
+        this.queue_repaint();
+    }
+
+    destroy() {
+        if (this._animTimerId) {
+            GLib.source_remove(this._animTimerId);
+            this._animTimerId = 0;
+        }
+        super.destroy();
     }
 
     setStyle(style) {
@@ -54,12 +79,66 @@ class OCRHighlightOverlay extends St.DrawingArea {
 
     vfunc_repaint() {
         const cr = this.get_context();
-        const shadow = [0, 0, 0, this._style.shadowOpacity];
 
         cr.setOperator(Cairo.Operator.CLEAR);
         cr.paint();
         cr.setOperator(Cairo.Operator.OVER);
 
+        // 1. Render Animated Chroma-Ring Wave Glow (Sayri Cajita Palette)
+        if (this._selectionGeometry) {
+            const sx = this._selectionGeometry.x;
+            const sy = this._selectionGeometry.y;
+            const sw = this._selectionGeometry.width;
+            const sh = this._selectionGeometry.height;
+
+            if (sw > 10 && sh > 10) {
+                const r = 16;
+                const waveCos = Math.cos(this._angle);
+                const waveSin = Math.sin(this._angle);
+                const centerX = sx + sw / 2;
+                const centerY = sy + sh / 2;
+                const radiusX = Math.max(sw / 1.4, 20);
+                const radiusY = Math.max(sh / 1.4, 20);
+                const waveFactor = 0.5 + 0.5 * Math.sin(this._angle * 2.0);
+
+                // Outward localized wave bloom layer
+                const bloomPat = new Cairo.LinearGradient(
+                    centerX + waveCos * radiusX,
+                    centerY + waveSin * radiusY,
+                    centerX - waveCos * radiusX,
+                    centerY - waveSin * radiusY
+                );
+                bloomPat.addColorStopRGBA(0.00, 0.486, 0.086, 0.431, 0.55 * waveFactor); // #7c166e Magenta
+                bloomPat.addColorStopRGBA(0.40, 0.118, 0.455, 0.984, 0.65 * waveFactor); // #1e74fb Electric Blue
+                bloomPat.addColorStopRGBA(0.75, 0.66, 0.33, 0.97, 0.55 * waveFactor);   // #a855f7 Purple
+                bloomPat.addColorStopRGBA(1.00, 0.043, 0.082, 0.200, 0.20);              // #0b1533 Midnight Navy
+
+                cr.setSource(bloomPat);
+                _roundedRect(cr, sx - 6, sy - 6, sw + 12, sh + 12, r + 2);
+                cr.setLineWidth(14 + 6 * waveFactor);
+                cr.stroke();
+
+                // Dynamic Rotating Core Border
+                const corePat = new Cairo.LinearGradient(
+                    centerX + waveCos * radiusX,
+                    centerY + waveSin * radiusY,
+                    centerX - waveCos * radiusX,
+                    centerY - waveSin * radiusY
+                );
+                corePat.addColorStopRGBA(0.00, 0.486, 0.086, 0.431, 0.98); // #7c166e
+                corePat.addColorStopRGBA(0.35, 0.118, 0.455, 0.984, 0.98); // #1e74fb
+                corePat.addColorStopRGBA(0.70, 0.66, 0.33, 0.97, 0.98);   // #a855f7
+                corePat.addColorStopRGBA(1.00, 0.22, 0.74, 0.97, 0.98);   // #38bdf8
+
+                cr.setSource(corePat);
+                _roundedRect(cr, sx, sy, sw, sh, r);
+                cr.setLineWidth(2.6 + 0.8 * waveFactor);
+                cr.stroke();
+            }
+        }
+
+        // 2. Render OCR Highlighted Boxes over detected words
+        const shadow = [0, 0, 0, this._style.shadowOpacity];
         for (const box of this._boxes) {
             const x = box.x - this._style.padding;
             const y = box.y - this._style.padding;
@@ -75,7 +154,7 @@ class OCRHighlightOverlay extends St.DrawingArea {
             _roundedRect(cr, x, y, width, height, radius);
             cr.fillPreserve();
 
-            cr.setSourceRGBA(...this._style.border);
+            cr.setSourceRGBA(0.66, 0.33, 0.97, 0.75);
             cr.setLineWidth(this._style.borderWidth);
             cr.stroke();
 
@@ -118,19 +197,17 @@ export class ScreenshotOCRController {
 
                 if (!this._ocrConfig.enabled)
                     this.reset();
-                else
-                    this.refreshSelection(Main.screenshotUI);
             });
         }
     }
 
     destroy() {
-        this.reset();
-
         if (this._settings && this._settingsChangedId) {
             this._settings.disconnect(this._settingsChangedId);
             this._settingsChangedId = 0;
         }
+
+        this.reset();
 
         if (this._overlay) {
             this._overlay.destroy();
@@ -155,8 +232,10 @@ export class ScreenshotOCRController {
         this._selectionBoxes = [];
         this._selectionKey = null;
 
-        if (this._overlay)
+        if (this._overlay) {
             this._overlay.setBoxes([]);
+            this._overlay.setSelectionGeometry(null);
+        }
 
         this._rebuildHitboxes([], null);
         this._hideCopyMenu();
@@ -175,7 +254,7 @@ export class ScreenshotOCRController {
             this._overlay.set_size(global.stage.width, global.stage.height);
             this._overlay.setStyle(this._style);
 
-            ui._stageScreenshotContainer.insert_child_above(this._overlay, ui._stageScreenshot);
+            ui.insert_child_above(this._overlay, ui._areaSelector);
         }
 
         if (!this._hitboxLayer) {
@@ -194,39 +273,45 @@ export class ScreenshotOCRController {
                 visible: false,
                 reactive: true,
                 style: `
-                    background-color: rgba(34, 36, 40, 0.96);
-                    border: 1px solid rgba(255, 255, 255, 0.12);
-                    border-radius: 12px;
-                    padding: 8px 12px;
-                    spacing: 12px;
+                    background-color: rgba(22, 24, 30, 0.94);
+                    border: 1px solid rgba(168, 85, 247, 0.4);
+                    border-radius: 9999px;
+                    padding: 4px 8px;
+                    spacing: 6px;
                     color: #f3f4f6;
                 `,
             });
             this._copyButton = new St.Button({
-                label: 'Copy',
+                label: '📋 Copiar',
                 can_focus: true,
                 y_align: Clutter.ActorAlign.CENTER,
                 style: `
-                    background-color: rgba(255,255,255,0.1);
-                    border-radius: 8px;
-                    padding: 6px 12px;
-                    font-weight: bold;
+                    background-color: rgba(99, 102, 241, 0.35);
+                    border: 1px solid rgba(168, 85, 247, 0.5);
+                    border-radius: 9999px;
+                    padding: 4px 12px;
+                    font-weight: 600;
                     color: white;
                 `,
             });
             this._copyButton.connect('clicked', () => {
                 this._copyActiveBoxText();
+                this._copyButton.label = '✓ Copiado';
+                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 800, () => {
+                    if (this._copyButton) this._copyButton.label = '📋 Copiar';
+                    return GLib.SOURCE_REMOVE;
+                });
             });
 
             this._searchButton = new St.Button({
-                label: 'Search',
+                label: '🔍 Buscar',
                 can_focus: true,
                 y_align: Clutter.ActorAlign.CENTER,
                 style: `
-                    background-color: rgba(255,255,255,0.1);
-                    border-radius: 8px;
-                    padding: 6px 12px;
-                    font-weight: bold;
+                    background-color: rgba(255, 255, 255, 0.1);
+                    border-radius: 9999px;
+                    padding: 4px 10px;
+                    font-weight: 600;
                     color: white;
                 `,
             });
@@ -238,7 +323,7 @@ export class ScreenshotOCRController {
             this._copyMenu.add_child(this._searchButton);
             this._hitboxLayer.add_child(this._copyMenu);
 
-            ui.insert_child_above(this._hitboxLayer, ui._areaSelector);
+            ui.insert_child_above(this._hitboxLayer, this._overlay);
         }
     }
 
@@ -252,14 +337,19 @@ export class ScreenshotOCRController {
     }
 
     refreshSelection(ui) {
-        if (!this._overlay || !ui || !this._ocrConfig.enabled || !ui._selectionButton?.checked) {
-            if (this._overlay)
+        if (!this._overlay || !ui || !ui._selectionButton?.checked) {
+            if (this._overlay) {
                 this._overlay.setBoxes([]);
+                this._overlay.setSelectionGeometry(null);
+            }
             this._rebuildHitboxes([], null);
             return;
         }
 
         const selection = this._getSelectionGeometry(ui);
+        this._overlay.set_size(global.stage.width, global.stage.height);
+        this._overlay.setSelectionGeometry(selection);
+
         const selectionKey = this._makeSelectionKey(selection);
         if (!selectionKey || selectionKey !== this._selectionKey) {
             this._overlay.setBoxes([]);
@@ -267,7 +357,6 @@ export class ScreenshotOCRController {
             return;
         }
 
-        this._overlay.set_size(global.stage.width, global.stage.height);
         this._overlay.setBoxes(this._selectionBoxes);
         this._rebuildHitboxes(this._selectionBoxes, selection);
     }
@@ -527,87 +616,32 @@ export class ScreenshotOCRController {
         }
         this._activeBoxText = fullText;
 
-        const [, naturalWidth] = this._copyMenu.get_preferred_width(-1);
-        const [, naturalHeight] = this._copyMenu.get_preferred_height(naturalWidth);
-
-        const menuWidth = naturalWidth || 200;
-        const menuHeight = naturalHeight || 44;
-
-        const margin = 12;
-        const stageWidth = global.stage.width;
-        const stageHeight = global.stage.height;
-
-        const centerX = selection.x + selection.width / 2;
-        const clampedCenterX = Math.max(
-            margin,
-            Math.min(stageWidth - menuWidth - margin, Math.round(centerX - menuWidth / 2))
-        );
-
-        const centerY = selection.y + selection.height / 2;
-        const clampedCenterY = Math.max(
-            margin,
-            Math.min(stageHeight - menuHeight - margin, Math.round(centerY - menuHeight / 2))
-        );
-
-        // Prefer below the selection, then above, then to either side, skipping
-        // any spot that runs off-screen or collides with the screenshot HUD.
-        const blocker = this._getHudRect(margin);
-        const candidates = [
-            {x: clampedCenterX, y: Math.round(selection.y + selection.height + margin)},
-            {x: clampedCenterX, y: Math.round(selection.y - menuHeight - margin)},
-            {x: Math.round(selection.x + selection.width + margin), y: clampedCenterY},
-            {x: Math.round(selection.x - menuWidth - margin), y: clampedCenterY},
-        ];
-
-        let placement = null;
-        for (const candidate of candidates) {
-            const rect = {x: candidate.x, y: candidate.y, width: menuWidth, height: menuHeight};
-            if (rect.x < margin || rect.y < margin ||
-                rect.x + menuWidth > stageWidth - margin ||
-                rect.y + menuHeight > stageHeight - margin)
-                continue;
-            if (blocker && _rectsOverlap(rect, blocker))
-                continue;
-            placement = candidate;
-            break;
-        }
-
-        if (!placement) {
-            // Nothing was fully clear; fall back to below/above on-screen.
-            const belowY = Math.round(selection.y + selection.height + margin);
-            const aboveY = Math.round(selection.y - menuHeight - margin);
-            const y = belowY + menuHeight <= stageHeight - margin
-                ? belowY
-                : Math.max(margin, aboveY);
-            placement = {x: clampedCenterX, y};
-        }
-
-        this._copyMenu.set_position(placement.x, placement.y);
-        this._copyMenu.visible = true;
-        this._hitboxLayer.set_child_above_sibling(this._copyMenu, null);
+        this._showCopyMenu(selection);
     }
 
-    _getHudRect(inflate = 0) {
-        const panel = Main.screenshotUI?._panel;
-        if (!panel || !panel.visible)
-            return null;
+    copySelectionText() {
+        if (!this._activeBoxText) {
+            if (this._showMessage)
+                this._showMessage('No text detected in selection');
+            return false;
+        }
 
-        const extents = panel.get_transformed_extents();
-        if (!extents)
-            return null;
+        const clipboard = St.Clipboard.get_default();
+        clipboard.set_text(St.ClipboardType.CLIPBOARD, this._activeBoxText);
+        clipboard.set_text(St.ClipboardType.PRIMARY, this._activeBoxText);
+        if (this._showMessage)
+            this._showMessage('Text copied to clipboard');
+        return true;
+    }
 
-        return {
-            x: extents.get_x() - inflate,
-            y: extents.get_y() - inflate,
-            width: extents.get_width() + inflate * 2,
-            height: extents.get_height() + inflate * 2,
-        };
+    _showCopyMenu(selection) {
+        // Floating overlay menu disabled in favor of main panel button
+        return;
     }
 
     _hideCopyMenu() {
         if (this._copyMenu)
             this._copyMenu.visible = false;
-        this._activeBoxText = '';
     }
 
     _copyActiveBoxText() {
@@ -698,13 +732,6 @@ export class ScreenshotOCRController {
             closeAfterCopy: this._settings.get_boolean('close-after-copy'),
         };
     }
-}
-
-function _rectsOverlap(a, b) {
-    return a.x < b.x + b.width &&
-        a.x + a.width > b.x &&
-        a.y < b.y + b.height &&
-        a.y + a.height > b.y;
 }
 
 function _roundedRect(cr, x, y, width, height, radius) {

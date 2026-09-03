@@ -17,21 +17,8 @@ sudo pacman -S zbar
 # Ubuntu/Debian
 sudo apt install tesseract-ocr
 sudo apt install zbar-tools
-
-# NixOS
-add this somewhere in you config
-
-environment.systemPackages = [
-    zbar
-    pkgs.tesseract # to install all languages
-    # or (pkgs.tesseract.override { enableLanguages = [ "eng" "rus" ]; }) to install only specific lanuages
-];
-
-environment.variables = {
-    TESSDATA_PREFIX = "${pkgs.tesseract}/share/tessdata";
-};
 ```
-Shotzy detects installed OCR languages from TESSDATA_PREFIX env variable or from `/usr/share/tessdata` if not specified.
+Shotzy detects installed OCR languages from `/usr/share/tessdata`.
 
 [Install](https://github.com/tesseract-ocr/tessdata/tree/main) extra Tesseract language packs to make them selectable in the OCR settings.
 

@@ -7,6 +7,7 @@ import Clutter from 'gi://Clutter';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
+import { getPointerWatcher } from 'resource:///org/gnome/shell/ui/pointerWatcher.js';
 
 import { ScreenshotOCRController } from './ocr.js';
 import { LensUploader } from './uploader.js';
@@ -74,6 +75,7 @@ export default class ShotzyExtension extends Extension {
             text => this._showScreenshotMessage(text)
         );
         this._lensButtonClickedId = 0;
+        this._sayriButtonClickedId = 0;
         this._qrButtonClickedId = 0;
         this._settingsChangedId = 0;
         this._uiOpenOriginal = null;
@@ -84,6 +86,7 @@ export default class ShotzyExtension extends Extension {
         this._overlayMessage = null;
         this._overlayMessageTimeoutId = 0;
 
+        this._setupShakeDetector();
         this._hookScreenshotUI();
         this._injectLensButton();
         this._settingsChangedId = this._settings.connect('changed', (_settings, key) => {
@@ -92,7 +95,72 @@ export default class ShotzyExtension extends Extension {
         });
     }
 
+    _setupShakeDetector() {
+        try {
+            this._pointerWatcher = getPointerWatcher();
+            let lastX = 0;
+            let lastY = 0;
+            let strokeDx = 0;
+            let strokeDir = 0;
+            let reversals = [];
+            let lastTrigger = 0;
+
+            this._shakeWatch = this._pointerWatcher.addWatch(20, (x, y) => {
+                if (lastX === 0 && lastY === 0) {
+                    lastX = x;
+                    lastY = y;
+                    return;
+                }
+                const dx = x - lastX;
+                lastX = x;
+                lastY = y;
+
+                if (dx === 0) return;
+                const now = Date.now();
+                const d = dx > 0 ? 1 : -1;
+
+                if (strokeDir === 0) {
+                    strokeDir = d;
+                    strokeDx = dx;
+                    return;
+                }
+
+                if (d === strokeDir) {
+                    strokeDx += dx;
+                } else {
+                    const strokeLen = Math.abs(strokeDx);
+                    if (strokeLen >= 20) {
+                        reversals.push({ time: now, len: strokeLen });
+                        reversals = reversals.filter(r => now - r.time <= 650);
+                        const totalDist = reversals.reduce((acc, r) => acc + r.len, 0);
+
+                        if (reversals.length >= 3 && totalDist >= 80) {
+                            if (now - lastTrigger >= 2000) {
+                                lastTrigger = now;
+                                reversals = [];
+                                strokeDx = 0;
+                                strokeDir = 0;
+                                if (Main.screenshotUI && !Main.screenshotUI._isOpen) {
+                                    Main.screenshotUI.open();
+                                }
+                            }
+                        }
+                    }
+                    strokeDir = d;
+                    strokeDx = dx;
+                }
+            });
+        } catch (e) {
+            log(`Shotzy shake detector error: ${e.message}`);
+        }
+    }
+
     disable() {
+        if (this._shakeWatch && this._pointerWatcher) {
+            this._pointerWatcher._removeWatch(this._shakeWatch);
+            this._shakeWatch = null;
+        }
+
         const ui = Main.screenshotUI;
         
         if (ui) {
@@ -128,6 +196,15 @@ export default class ShotzyExtension extends Extension {
             this._lensWrapper = null;
         }
 
+        if (this._sayriButton) {
+            if (this._sayriButtonClickedId) {
+                this._sayriButton.disconnect(this._sayriButtonClickedId);
+                this._sayriButtonClickedId = 0;
+            }
+            this._sayriButton.destroy();
+            this._sayriButton = null;
+        }
+
         if (this._lensButton) {
             if (this._lensButtonClickedId) {
                 this._lensButton.disconnect(this._lensButtonClickedId);
@@ -135,6 +212,15 @@ export default class ShotzyExtension extends Extension {
             }
             this._lensButton.destroy();
             this._lensButton = null;
+        }
+
+        if (this._copyTextButton) {
+            if (this._copyTextButtonClickedId) {
+                this._copyTextButton.disconnect(this._copyTextButtonClickedId);
+                this._copyTextButtonClickedId = 0;
+            }
+            this._copyTextButton.destroy();
+            this._copyTextButton = null;
         }
 
         if (this._qrButton) {
@@ -176,7 +262,8 @@ export default class ShotzyExtension extends Extension {
             ui.open = async (...args) => {
                 const result = await this._uiOpenOriginal.apply(ui, args);
 
-                if (ui._shotButton?.checked) {
+                this._ocrController.ensureAttached(ui);
+                if (ui._selectionButton?.checked) {
                     this._ocrController.start(ui).catch(e => {
                         log(`Shotzy: OCR start failed: ${e.message}`);
                     });
@@ -225,49 +312,116 @@ export default class ShotzyExtension extends Extension {
 
     _injectLensButton() {
         const ui = Main.screenshotUI;
-        if (!ui || !ui._panel || !ui._showPointerButtonContainer) return;
+        if (!ui || !ui._panel) return;
 
+        if (!this._actionsRow) {
+            this._actionsRow = new St.BoxLayout({
+                style_class: 'screenshot-ui-actions-row',
+                vertical: false,
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                style: `
+                    margin-top: 14px;
+                    spacing: 16px;
+                    padding: 6px 14px;
+                    background-color: rgba(255, 255, 255, 0.05);
+                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    border-radius: 9999px;
+                `,
+            });
+        }
+
+        // 1. Sayri Button (Clean PNG, large size)
+        if (!this._sayriButton) {
+            let iconChild;
+            const sayriPng = '/usr/share/icons/hicolor/48x48/apps/sayri-tray.png';
+            if (GLib.file_test(sayriPng, GLib.FileTest.EXISTS)) {
+                iconChild = new St.Icon({
+                    gicon: Gio.FileIcon.new(Gio.File.new_for_path(sayriPng)),
+                    icon_size: 28,
+                });
+            } else {
+                iconChild = new St.Icon({
+                    icon_name: 'starred-symbolic',
+                    icon_size: 28,
+                });
+            }
+
+            this._sayriButton = new St.Button({
+                style_class: 'screenshot-ui-show-pointer-button',
+                child: iconChild,
+                can_focus: true,
+                style: 'padding: 8px 16px; min-width: 48px; min-height: 48px;',
+            });
+            this._sayriButtonClickedId = this._sayriButton.connect('clicked', () => {
+                this._handleSayriClick().catch(e => {
+                    log(`Shotzy Sayri error: ${e.message}`);
+                });
+            });
+            this._actionsRow.add_child(this._sayriButton);
+
+            const sayriTooltip = new Tooltip(this._sayriButton, 'Ask Sayri');
+            ui.add_child(sayriTooltip);
+            this._tooltips.push(sayriTooltip);
+        }
+
+        // 2. Google Search Button (Colorful Google logo, large size)
         if (!this._lensButton) {
+            let googleIconChild;
+            const googleSvg = '/usr/share/icons/hicolor/scalable/apps/goa-account-google.svg';
+            if (GLib.file_test(googleSvg, GLib.FileTest.EXISTS)) {
+                googleIconChild = new St.Icon({
+                    gicon: Gio.FileIcon.new(Gio.File.new_for_path(googleSvg)),
+                    icon_size: 28,
+                });
+            } else {
+                googleIconChild = new St.Icon({
+                    icon_name: 'system-search-symbolic',
+                    icon_size: 28,
+                });
+            }
+
             this._lensButton = new St.Button({
                 style_class: 'screenshot-ui-show-pointer-button',
-                child: new St.Icon({
-                    icon_name: 'system-search-symbolic',
-                    icon_size: 24,
-                }),
+                child: googleIconChild,
                 can_focus: true,
+                style: 'padding: 8px 16px; min-width: 48px; min-height: 48px;',
             });
-            this._lensButton.set_style('margin-left: 10px;');
             this._lensButtonClickedId = this._lensButton.connect('clicked', () => {
                 this._handleLensClick().catch(e => {
                     log(`Shotzy Search error: ${e.message}`);
                 });
             });
-            ui._showPointerButtonContainer.add_child(this._lensButton);
+            this._actionsRow.add_child(this._lensButton);
 
-            const lensTooltip = new Tooltip(this._lensButton, 'Search with Google Lens');
+            const lensTooltip = new Tooltip(this._lensButton, 'Search with Google');
             ui.add_child(lensTooltip);
             this._tooltips.push(lensTooltip);
         }
 
-        if (!this._qrButton) {
-            this._qrButton = new St.Button({
+        // 3. Copy OCR Text Button (Large size)
+        if (!this._copyTextButton) {
+            this._copyTextButton = new St.Button({
                 style_class: 'screenshot-ui-show-pointer-button',
                 child: new St.Icon({
-                    icon_name: 'view-grid-symbolic',
-                    icon_size: 24,
+                    icon_name: 'edit-copy-symbolic',
+                    icon_size: 28,
                 }),
                 can_focus: true,
+                style: 'padding: 8px 16px; min-width: 48px; min-height: 48px;',
             });
-            this._qrButton.set_style('margin-top: 10px;');
-            this._qrButtonClickedId = this._qrButton.connect('clicked', () => {
-                this._handleQRClick().catch(e => {
-                    log(`Shotzy QR error: ${e.message}`);
-                });
+            this._copyTextButtonClickedId = this._copyTextButton.connect('clicked', () => {
+                this._ocrController?.copySelectionText();
             });
+            this._actionsRow.add_child(this._copyTextButton);
 
-            const qrTooltip = new Tooltip(this._qrButton, 'Scan QR Code');
-            ui.add_child(qrTooltip);
-            this._tooltips.push(qrTooltip);
+            const copyTooltip = new Tooltip(this._copyTextButton, 'Copy Text');
+            ui.add_child(copyTooltip);
+            this._tooltips.push(copyTooltip);
+        }
+
+        if (this._actionsRow.get_parent() !== ui._panel) {
+            ui._panel.add_child(this._actionsRow);
         }
 
         this._syncActionButtons();
@@ -275,38 +429,43 @@ export default class ShotzyExtension extends Extension {
 
     _syncActionButtons() {
         const ui = Main.screenshotUI;
-        if (!ui || !ui._panel || !ui._showPointerButtonContainer)
+        if (!ui || !ui._panel)
             return;
 
         this._ensureButtonsAttached(ui);
 
-        const showLensButton = this._settings?.get_boolean('show-google-lens-button') ?? true;
-        const showQrButton = this._settings?.get_boolean('show-qr-button') ?? true;
+        if (this._sayriButton) {
+            this._sayriButton.visible = true;
+            this._sayriButton.reactive = true;
+            this._sayriButton.can_focus = true;
+        }
 
         if (this._lensButton) {
-            this._lensButton.visible = showLensButton;
-            this._lensButton.reactive = showLensButton;
-            this._lensButton.can_focus = showLensButton;
+            this._lensButton.visible = true;
+            this._lensButton.reactive = true;
+            this._lensButton.can_focus = true;
         }
 
-        if (this._qrButton) {
-            this._qrButton.visible = showQrButton;
-            this._qrButton.reactive = showQrButton;
-            this._qrButton.can_focus = showQrButton;
+        if (this._copyTextButton) {
+            this._copyTextButton.visible = true;
+            this._copyTextButton.reactive = true;
+            this._copyTextButton.can_focus = true;
         }
-
-        if (showQrButton)
-            this._ensureQrLayout(ui);
-        else
-            this._restoreDefaultLayout(ui);
     }
 
     _ensureButtonsAttached(ui) {
-        if (this._lensButton && this._lensButton.get_parent() !== ui._showPointerButtonContainer)
-            ui._showPointerButtonContainer.add_child(this._lensButton);
+        if (this._actionsRow && this._actionsRow.get_parent() !== ui._panel) {
+            ui._panel.add_child(this._actionsRow);
+        }
 
-        if (this._qrButton && this._lensSideBox && this._qrButton.get_parent() !== this._lensSideBox)
-            this._lensSideBox.add_child(this._qrButton);
+        if (this._sayriButton && this._sayriButton.get_parent() !== this._actionsRow)
+            this._actionsRow.add_child(this._sayriButton);
+
+        if (this._lensButton && this._lensButton.get_parent() !== this._actionsRow)
+            this._actionsRow.add_child(this._lensButton);
+
+        if (this._copyTextButton && this._copyTextButton.get_parent() !== this._actionsRow)
+            this._actionsRow.add_child(this._copyTextButton);
     }
 
     _ensureQrLayout(ui) {
@@ -380,8 +539,66 @@ export default class ShotzyExtension extends Extension {
         this._lensInnerVBox = null;
         this._lensSideBox?.destroy();
         this._lensSideBox = null;
-        this._lensWrapper.destroy();
+        this._lensWrapper?.destroy();
         this._lensWrapper = null;
+    }
+
+    async _handleSayriClick() {
+        const ui = Main.screenshotUI;
+
+        const geometry = ui._getSelectedGeometry(true);
+        if (!geometry || geometry[2] <= 0 || geometry[3] <= 0) {
+            return;
+        }
+        const [x, y, w, h] = geometry;
+
+        const content = ui._stageScreenshot?.get_content();
+        if (!content) return;
+        const texture = content.get_texture();
+
+        const stream = Gio.MemoryOutputStream.new_resizable();
+        try {
+            const pixbuf = await Shell.Screenshot.composite_to_stream(
+                texture,
+                x, y, w, h,
+                ui._scale,
+                null, 0, 0, 1,
+                stream
+            );
+            stream.close(null);
+
+            ui.close();
+
+            const filename = GLib.build_filenamev([GLib.get_tmp_dir(), `sayri_circle_${Date.now()}.png`]);
+            if (pixbuf.savev(filename, 'png', [], [])) {
+                Main.notify('Sayri', 'Opening Sayri with selection...');
+                Gio.Subprocess.new(
+                    ['python3', '-c', `
+import socket, os
+from pathlib import Path
+candidate_sockets = [
+    Path.home() / '.local/share/sayri/sayri.sock',
+    Path(f'/run/user/{os.getuid()}/sayri.sock'),
+]
+for s in candidate_sockets:
+    if s.is_socket():
+        try:
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.connect(str(s))
+            c.sendall(b'attach ${filename}\\n')
+            c.recv(1024)
+            c.close()
+            break
+        except Exception:
+            pass
+`],
+                    Gio.SubprocessFlags.NONE
+                );
+            }
+        } catch (e) {
+            log(`Shotzy Sayri error: ${e.message}`);
+            ui.close();
+        }
     }
 
     async _handleLensClick() {
